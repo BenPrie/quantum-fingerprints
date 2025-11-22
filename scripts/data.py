@@ -8,7 +8,8 @@ from typing import Literal
 
 # Options for the feature vector.
 FeatureType = Literal[
-    'raw', 'res', 'abs_res', 'rel_res', 'abs_rel_res', 'log_ratio', 'qubit_res', 'abs_qubit_res', 'pauli_z_res', 'pauli_zz_res']
+    'raw', 'res', 'abs_res', 'rel_res', 'abs_rel_res', 'log_ratio', 'qubit_res', 'abs_qubit_res', 'pauli_z_res', 'pauli_zz_res'
+]
 
 
 class QuantumDataset(Dataset):
