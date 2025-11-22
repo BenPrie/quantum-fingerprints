@@ -30,9 +30,10 @@ class QuantumDataset(Dataset):
         self.features = self._precompute_features()
 
         # Standardisation.
-        mean = self.features.mean(dim=0)
-        std = self.features.std(dim=0)
-        self.features = (self.features - mean) / (std + 1e-6)
+        if feature_type != 'raw':
+            mean = self.features.mean(dim=0)
+            std = self.features.std(dim=0)
+            self.features = (self.features - mean) / (std + 1e-6)
 
     def _precompute_features(self) -> torch.Tensor:
         # Small value for div-by-zero handling.
@@ -43,8 +44,8 @@ class QuantumDataset(Dataset):
         y_cols = [col for col in self.df.columns if col.startswith('y')]
 
         # Relevant values.
-        x_probs = torch.tensor(self.df[x_cols].values, dtype=torch.float64)
-        y_probs = torch.tensor(self.df[y_cols].values, dtype=torch.float64)
+        x_probs = torch.tensor(self.df[x_cols].values, dtype=torch.float32)
+        y_probs = torch.tensor(self.df[y_cols].values, dtype=torch.float32)
 
         # Per-outcome feature types...
 
