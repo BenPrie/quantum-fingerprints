@@ -1,135 +1,235 @@
 # Imports, as always...
-from os import makedirs, path
-from tqdm.notebook import tqdm
-import numpy as np
+import time
+import copy
+
 import torch
+import torch.nn as nn
 
-from torch.optim import Adam
-from torch.nn.functional import one_hot
+import matplotlib
+import matplotlib.pyplot as plt
+from IPython.display import clear_output
 
+seed = 42
+torch.random.manual_seed(seed)
+test_split, val_split = .2, .2
 
-# Function to perform a single training step (i.e. one epoch).
-def training_step(model, device, loader, optimiser, loss_fn):
-    # Use train mode.
-    model.train()
-
-    # Track the running loss and accuracy.
-    running_loss = 0
-    running_acc = 0
-
-    # Iterate over the loader (if verbose is true, give a progress bar).
-    for xs, ys_true in loader:
-        # Handling a singleton batch (PyTorch is not a fan).
-        if xs.shape[0] == 1:
-            continue
-
-        # Move to device.
-        xs = xs.to(device)
-        ys_true = ys_true.to(device)
-
-        # Zero gradients.
-        optimiser.zero_grad()
-
-        # Predict labels.
-        ys_pred = model(xs)
-
-        # Compute loss (adding to the running loss) and calculate gradients.
-        loss = loss_fn(ys_pred, one_hot(ys_true.to(int), num_classes=ys_pred.shape[-1]).to(float))
-        running_loss += loss.item()
-        loss.backward()
-
-        # Hardmax to get predicted class and compute accuracy.
-        ys_pred_hardmax = torch.argmax(ys_pred, dim=1)
-        running_acc += torch.sum(ys_pred_hardmax == ys_true).item()
-
-        # Adjust weights.
-        optimiser.step()
-
-    # Return the average loss and accuracy over the epoch.
-    return running_loss / len(loader), running_acc / len(loader.dataset)
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
-# Function to evaluate with the given loader (i.e. validation/testing).
-def evaluate(model, device, loader, loss_fn):
-    # Use evaluation mode.
+def binary_accuracy(logits, targets):
+    # Case 1: BCE-style output
+    if logits.ndim == 1 or logits.shape[1] == 1:
+        logits = logits.view(-1)
+        probs = torch.sigmoid(logits)
+        preds = (probs >= 0.5).long()
+    # Case 2: CE-style output
+    else:
+        preds = torch.argmax(logits, dim=1)
+
+    return (preds == targets).float().mean().item()
+
+def evaluate(model, dataloader):
     model.eval()
+    total_loss = 0.0
+    total_acc = 0.0
+    total_samples = 0
 
-    # Track the running loss and accuracy.
-    running_loss = 0
-    running_acc = 0
+    loss_fn_bce = nn.BCEWithLogitsLoss()
+    loss_fn_ce = nn.CrossEntropyLoss()
 
-    # For evaluation, we do not track gradients.
     with torch.no_grad():
-        # Iterate over the loader (if verbose is true, give a progress bar).
-        for xs, ys_true in loader:
-            if xs.shape[0] == 1:
-                continue
+        for x, y in dataloader:
+            x = x.to(device)
+            y = y.to(device)
 
-            # Move to device.
-            xs = xs.to(device)
-            ys_true = ys_true.to(device)
+            outputs = model(x)
 
-            # Predict labels.
-            ys_pred = model(xs)
+            # Auto select loss
+            if outputs.ndim == 1 or outputs.shape[1] == 1:
+                outputs = outputs.view(-1)
+                loss = loss_fn_bce(outputs, y.float())
+            else:
+                loss = loss_fn_ce(outputs, y)
 
-            # Compute loss (adding to the running loss).
-            running_loss += loss_fn(ys_pred, one_hot(ys_true.to(int), num_classes=ys_pred.shape[-1]).to(float)).item()
+            batch_size = y.size(0)
+            acc = binary_accuracy(outputs, y)
 
-            # Hardmax to get predicted class and compute accuracy.
-            ys_pred_hardmax = torch.argmax(ys_pred, dim=1)
-            running_acc += torch.sum(ys_pred_hardmax == ys_true).item()
+            total_loss += loss.item() * batch_size
+            total_acc += acc * batch_size
+            total_samples += batch_size
 
-    # Return the average loss and accuracy over the loader.
-    return running_loss / len(loader), running_acc / len(loader.dataset)
+    return total_loss / total_samples, total_acc / total_samples
 
 
-# Function to perform a full training routine.
-def train(model, device, loss_fn, train_loader, val_loader, n_epochs, lr=1e-3, weight_decay=.0, verbose=False, print_interval=10, save_dir=None,
-          save_file_name='model-dict', seed=0):
-    # RNG.
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+def train(
+        model,
+        train_loader,
+        val_loader,
+        optimizer,
+        epochs,
+        verbose=False,
+        seed=42,
+        early_stopping=True,
+        patience=10,
+        min_delta=1e-4,
+        restore_best_weights=True
+):
+    torch.random.manual_seed(seed)
 
-    # Create the save directory.
-    if save_dir: makedirs(save_dir, exist_ok=True)
+    model.to(device)
 
-    # Set up an optimiser and loss function.
-    optimiser = Adam(params=model.parameters(), lr=lr, weight_decay=weight_decay)
+    bce_loss = nn.BCEWithLogitsLoss()
+    ce_loss = nn.CrossEntropyLoss()
 
-    # Track the best validation loss so that we may return to the best weights on termination.
-    best_val_loss = np.inf
-    best_state = model.state_dict()
+    # Metrics history
+    train_losses = []
+    val_losses = []
+    train_accs = []
+    val_accs = []
 
-    # Remember the training statistics, just in case someone feels like plotting it.
-    train_losses, train_accs, val_losses, val_accs = [], [], [], []
+    start_time = time.time()
 
-    for epoch_idx in (
-    tqdm(np.arange(1, n_epochs + 1), desc='Top-level training') if verbose else np.arange(1, n_epochs + 1)):
-        # Train the model.
-        train_loss, train_acc = training_step(model, device, train_loader, optimiser, loss_fn)
-        val_loss, val_acc = evaluate(model, device, val_loader, loss_fn)
+    # ----- Early stopping state -----
+    best_val_loss = float("inf")
+    best_model_state = None
+    epochs_without_improve = 0
 
-        # Store those stats.
+    if verbose:
+        # For live plotting.
+        matplotlib.use("TkAgg")
+        plt.ion()
+
+        fig, (ax_loss, ax_acc) = plt.subplots(1, 2, figsize=(12, 5))
+        fig.canvas.manager.set_window_title("Training Progress")
+        plt.show(block=False)
+
+    for epoch in range(epochs):
+        # ----- TRAIN -----
+        model.train()
+        running_loss = 0.0
+        running_acc = 0.0
+        n = 0
+
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(x)
+
+            # Auto-detect output type
+            if outputs.ndim == 1 or outputs.shape[1] == 1:
+                outputs = outputs.view(-1)
+                loss = bce_loss(outputs, y.float())
+            else:
+                loss = ce_loss(outputs, y)
+
+            loss.backward()
+            optimizer.step()
+
+            bs = y.size(0)
+
+            running_loss += loss.item() * bs
+            running_acc += binary_accuracy(outputs, y) * bs
+            n += bs
+
+        train_loss = running_loss / n
+        train_acc = running_acc / n
+
+        # ----- VALIDATION -----
+        val_loss, val_acc = evaluate(model, val_loader)
+
+        # Store metrics
         train_losses.append(train_loss)
         train_accs.append(train_acc)
         val_losses.append(val_loss)
         val_accs.append(val_acc)
 
-        # Update the best validation loss and remember the model's state.
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_state = model.state_dict()
+        # ----- Early Stopping Logic -----
+        if early_stopping:
+            if val_loss < best_val_loss - min_delta:
+                best_val_loss = val_loss
+                best_model_state = copy.deepcopy(model.state_dict())
+                epochs_without_improve = 0
+            else:
+                epochs_without_improve += 1
 
-            # Save the model (if a save path has been given).
-            if save_dir: torch.save(best_state, path.join(save_dir, f'{save_file_name}.pt'))
+            if epochs_without_improve >= patience:
+                if restore_best_weights and best_model_state is not None:
+                    model.load_state_dict(best_model_state)
+                break
 
-        # Print the stats (if verbose).
-        if verbose and epoch_idx % print_interval == 0:
+        if not verbose:
+            continue
+
+        if (epoch + 1) % 5 == 0 or epoch == epochs - 1:
+            # ----- ETA -----
+            elapsed = time.time() - start_time
+            done = epoch + 1
+            time_per_epoch = elapsed / done
+            remaining = time_per_epoch * (epochs - done)
+            mins, secs = divmod(int(remaining), 60)
+
+            # ----- Clear notebook output (text + figure) -----
+            clear_output(wait=True)
+
+            # ---- Update figure safely ----
+            ax_loss.cla()
+            ax_acc.cla()
+
+            ax_loss.plot(train_losses, label="Train Loss")
+            ax_loss.plot(val_losses, label="Val Loss")
+            ax_loss.set_title("Loss")
+            ax_loss.set_xlabel("Epoch")
+            ax_loss.legend()
+            ax_loss.set_xlim(0, epochs)
+
+            ax_acc.plot(train_accs, label="Train Acc")
+            ax_acc.plot(val_accs, label="Val Acc")
+            ax_acc.set_title("Accuracy")
+            ax_acc.set_xlabel("Epoch")
+            ax_acc.legend(loc='lower right')
+            ax_acc.set_ylim(.45, 1.01)
+            ax_acc.set_xlim(0, epochs)
+
+            fig.suptitle(f"Epoch {done}/{epochs} | ETA {mins:02d}:{secs:02d}")
+
+            fig.canvas.draw()
+            fig.canvas.flush_events()
+
             print(
-                f'Epoch {epoch_idx:03d}: train loss - {train_loss:.3f}, val loss - {val_loss:.3f}, train acc - {train_acc:.3f}, val acc - {val_acc:.3f}')
+                f"Epoch {done}/{epochs} | "
+                f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
+                f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}"
+            )
 
-    # Restore the best model in validation.
-    model.load_state_dict(best_state)
+    if verbose:
+        plt.close(fig)
+        plt.ioff()
 
-    # Return the stats.
+        # Back to inline.
+        matplotlib.use("module://matplotlib_inline.backend_inline")
+
+        fig, (ax_loss, ax_acc) = plt.subplots(1, 2, figsize=(12, 5))
+
+        ax_loss.plot(train_losses, label="Train Loss")
+        ax_loss.plot(val_losses, label="Val Loss")
+        ax_loss.set_title("Loss")
+        ax_loss.set_xlabel("Epoch")
+        ax_loss.legend()
+        ax_loss.set_xlim(0, epochs)
+
+        ax_acc.plot(train_accs, label="Train Acc")
+        ax_acc.plot(val_accs, label="Val Acc")
+        ax_acc.set_title("Accuracy")
+        ax_acc.set_xlabel("Epoch")
+        ax_acc.legend(loc='lower right')
+        ax_acc.set_ylim(.45, 1.01)
+        ax_acc.set_xlim(0, epochs)
+
+        plt.show()
+
+    # Restore best model at end if requested
+    if early_stopping and restore_best_weights and best_model_state is not None:
+        model.load_state_dict(best_model_state)
+
     return train_losses, train_accs, val_losses, val_accs
