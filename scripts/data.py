@@ -12,6 +12,25 @@ FeatureType = Literal[
 ]
 
 
+# Helper function to create a balanced subset for two devices.
+def stratified_sample(df, n, device_a_label=0, device_b_label=1, random_state=None):
+    # Split into device 0 and device 1.
+    df_0 = df[df['device'] == device_a_label]
+    df_1 = df[df['device'] == device_b_label]
+
+    # Too large an n?
+    assert n <= len(df_0) and n <= len(df_1), 'n must be smaller than each dataset.'
+
+    # Sample.
+    sample_0 = df_0.sample(n=n, random_state=random_state)
+    sample_1 = df_1.sample(n=n, random_state=random_state)
+
+    # Combine and shuffle the result
+    result = pd.concat([sample_0, sample_1]).sample(frac=1, random_state=random_state).reset_index(drop=True)
+
+    return result
+
+
 class QuantumDataset(Dataset):
     """Custom dataset for handling our measurement data and computing features."""
 
